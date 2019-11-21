@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"sort"
 	"time"
 
@@ -31,7 +32,7 @@ func main() {
 			Value: "/dev/gpiochip0",
 			Usage: "Device to use for GPIO",
 		},
-		cli.Uint64Flag{
+		cli.UintFlag{
 			Name:  "clock-pin",
 			Value: 27,
 			Usage: "UPS Pico clock pin",
@@ -40,11 +41,6 @@ func main() {
 			Name:  "pulse-pin",
 			Value: 22,
 			Usage: "UPS Pico pulse pin",
-		},
-		cli.StringFlag{
-			Name:  "shutdown-command",
-			Value: "/sbin/shutdown -h now",
-			Usage: "command to run when UPS requests shutdown",
 		},
 	}
 	app.Action = func(c *cli.Context) error {
@@ -66,15 +62,73 @@ func main() {
 		if err != nil {
 			log.Fatalf("err: %s", err)
 		}
+		writeLines, err := gpiochip.OpenLines(
+			gpio.GPIOHANDLE_REQUEST_OUTPUT,
+			"upspico-write",
+			uint32(c.Uint("pulse-pin")))
+		if err != nil {
+			log.Panicf("error opening write line %d: %s", c.Uint("pulse-pin"), err)
+		}
+		eventInterval := uint64(time.Now().Nanosecond())
+		out := int8(0)
+		pendingShutdown := false
+		cnt := 0
 		for {
 			ev, err := eventer.Wait(time.Second * 5)
 			if err != nil {
 				log.Warningf("error while waiting for event: %T %s", err, err)
 			}
 			if ev.ID > 0 {
-				log.Infof("Got event %d", ev.ID)
+				cnt++
+				diff := ev.Timestamp - eventInterval
+				_ = diff
+				eventInterval = ev.Timestamp
+				out = out ^ 1
+				log.Infof("interval: %f ms", float64(diff)/1000/1000)
+				writeLines.SetBulk(byte(out))
+				writeLines.Flush()
 			} else {
 				log.Info("empty event %+v", ev)
+			}
+			if cnt%2 == 1 || true {
+				writeLines.Close()
+				readLines, err := gpiochip.OpenLines(
+					gpio.GPIOHANDLE_REQUEST_INPUT,
+					"upspico-read",
+					uint32(c.Uint("pulse-pin")),
+				)
+				if err != nil {
+					log.Panicf("can't open pulse pin for reading: %s")
+				}
+				HandleData, err := readLines.Read()
+				log.Warningf("%+v", HandleData.Values[0])
+				if HandleData.Values[0] == 0 {
+					pendingShutdown = true
+				} else {
+					pendingShutdown = false
+				}
+				if pendingShutdown {
+					log.Warning("Triggering shutdown in 3s")
+					time.Sleep(time.Second * 3)
+					cmd := exec.Command("/sbin/shutdown", "-h", "now")
+					err := cmd.Run()
+					if err != nil {
+						log.Errorf("error running shutdown: %s", err)
+					}
+				}
+
+				readLines.Close()
+				writeLines, err = gpiochip.OpenLines(
+					gpio.GPIOHANDLE_REQUEST_OUTPUT,
+					"upspico-write",
+					uint32(c.Uint("pulse-pin")),
+				)
+				writeLines.SetBulk(byte(out))
+				writeLines.Flush()
+				if err != nil {
+					log.Panicf("can't reopen pulse pin for writing: %s")
+				}
+
 			}
 		}
 		return nil

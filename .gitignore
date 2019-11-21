@@ -44,7 +44,7 @@ _testmain.go
 *.prof
 *.out
 *.static
-main
+upspico
 *.arm
 *.arm64
 *.386
